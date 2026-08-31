@@ -1,0 +1,366 @@
+openapi: 3.1.0
+
+info:
+  title: GorBooking API
+  version: 0.1.0
+  description: |
+    A booking service for customers reserving badminton courts at a sports hall and staff managing court operations.
+
+    ## Conventions
+
+    All money amounts are whole numbers in the smallest unit of currency which is IDR in integer rupiah and with no decimals. All timestamps follow the rules set out in RFC 3339, with the timezone offset added. Clients should ignore response fields they don't recognise, and they should not crash when they see a status value they don't know.
+
+    ## Idempotency
+
+    The `Idempotency-Key` header requires a version-4 UUID with hyphens. Required on `POST /v1/bookings` and ignored everywhere else. Keys are kept for 24 hours. A key reused after that is treated as new. Reusing a key with different body contents returns 409 Conflict with type `https://api.example.com/problems/idempotency-key-reuse`.
+
+servers:
+  - url: https://api.example.com/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local development
+
+tags:
+  - name: Courts
+    description: Badminton courts in the sports hall.
+  - name: Bookings
+    description: Court reservations and status updates.
+
+paths:
+  /courts:
+    get:
+      operationId: listCourts
+      summary: List sports hall badminton courts
+      tags: [Courts]
+      description: |
+        Returns all badminton courts. Courts closed for maintenance are included with isAvailable false so the app can display them greyed out instead of hiding them completely.
+      parameters:
+        - name: isAvailable
+          in: query
+          required: false
+          description: Filter to open or maintenance-locked courts.
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of courts to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: Cursor token from the previous page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The list of courts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Court'
+                  nextCursor:
+                    type: string
+                    example: eyJvZmZzZXQiOjIwfQ
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /bookings:
+    post:
+      operationId: createBooking
+      summary: Reserve a badminton court
+      tags: [Bookings]
+      description: |
+        Books a court slot for a player and processes advance payment. Requires an Idempotency-Key header so retries on unreliable Wi-Fi do not duplicate bookings or charge the customer twice.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 0f7c1b9e-3d21-4a6f-9c05-8e2b7d41a9f0
+          description: |
+            Created by the client when the user taps confirm booking, and reused unchanged for every retry of that same intention. Kept for 24 hours. Reusing a key with a different body returns 409 idempotency-key-reuse.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewBooking'
+      responses:
+        '201':
+          description: Booking created, or the replayed original response on retry.
+          headers:
+            Location:
+              description: URI of the created booking.
+              schema:
+                type: string
+              example: /v1/bookings/bkg_4Fa93cD1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /bookings/{bookingId}:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        description: Server-generated booking ID.
+        schema:
+          type: string
+          pattern: '^bkg_[A-Za-z0-9]{4,}$'
+        example: bkg_4Fa93cD1
+    get:
+      operationId: getBooking
+      summary: Get details of a booking
+      tags: [Bookings]
+      responses:
+        '200':
+          description: The booking record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/cancellation:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+        example: bkg_4Fa93cD1
+    post:
+      operationId: cancelBooking
+      summary: Cancel an existing booking
+      tags: [Bookings]
+      description: |
+        Cancels a confirmed booking. Requires an audit reason in the body. Re-sending this when the booking is already cancelled returns 200 with the existing record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  example: Urgent roof leak repair needed on court
+      responses:
+        '200':
+          description: Already cancelled. The existing record is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cancellation'
+        '201':
+          description: Cancelled successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cancellation'
+        '409':
+          description: The transition is not permitted from the current status.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://api.example.com/problems/illegal-transition
+                title: That status change is not permitted
+                status: 409
+                detail: bkg_4Fa93cD1 is completed; cancellation is refused.
+                instance: /v1/bookings/bkg_4Fa93cD1/cancellation
+                from: completed
+                to: cancelled
+                allowedFrom: [confirmed]
+
+components:
+  schemas:
+    Court:
+      type: object
+      required: [id, name, hallLocation, isAvailable, hourlyRate, currency]
+      properties:
+        id:
+          type: string
+          pattern: '^crt_[A-Za-z0-9]{3,}$'
+          description: Opaque identifier generated by the server.
+          example: crt_8Bx1
+        name:
+          type: string
+          example: Court 1 (Vinyl Floor)
+        hallLocation:
+          type: string
+          example: Main Sports Hall - Sector A
+        isAvailable:
+          type: boolean
+          description: False when closed for repairs or scheduled maintenance.
+          example: true
+        hourlyRate:
+          type: integer
+          description: Hourly rate in the minor unit of currency (whole IDR rupiah).
+          example: 50000
+        currency:
+          type: string
+          example: IDR
+
+    Booking:
+      type: object
+      required: [id, courtId, status, startTime, endTime, qrCodeToken, grandTotal, currency]
+      properties:
+        id:
+          type: string
+          pattern: '^bkg_[A-Za-z0-9]{4,}$'
+          example: bkg_4Fa93cD1
+        courtId:
+          type: string
+          example: crt_8Bx1
+        status:
+          type: string
+          enum: [confirmed, ready, checked_in, completed, cancelled]
+          description: |
+            Clients MUST treat a value they do not recognise as 'in progress' and MUST NOT crash on it.
+          example: confirmed
+        startTime:
+          type: string
+          format: date-time
+          description: Slot start timestamp with UTC offset.
+          example: '2026-09-01T18:00:00+07:00'
+        endTime:
+          type: string
+          format: date-time
+          description: Slot end timestamp with UTC offset (2 hours slot).
+          example: '2026-09-01T20:00:00+07:00'
+        qrCodeToken:
+          type: string
+          description: Token used by the gate kiosk scanner to check in.
+          example: qr_tok_9918273645
+        grandTotal:
+          type: integer
+          description: Total advance payment in minor currency units (whole IDR).
+          example: 100000
+        currency:
+          type: string
+          example: IDR
+
+    NewBooking:
+      type: object
+      required: [courtId, startTime, endTime]
+      properties:
+        courtId:
+          type: string
+          example: crt_8Bx1
+        startTime:
+          type: string
+          format: date-time
+          example: '2026-09-01T18:00:00+07:00'
+        endTime:
+          type: string
+          format: date-time
+          example: '2026-09-01T20:00:00+07:00'
+
+    Cancellation:
+      type: object
+      required: [bookingId, reason, cancelledAt]
+      properties:
+        bookingId:
+          type: string
+          example: bkg_4Fa93cD1
+        reason:
+          type: string
+          example: Urgent roof leak repair needed on court
+        cancelledAt:
+          type: string
+          format: date-time
+          example: '2026-09-01T14:30:00+07:00'
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      additionalProperties: true
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Stable URI identifying the problem type.
+          example: https://api.example.com/problems/court-unavailable
+        title:
+          type: string
+          description: Short human-readable summary for developers.
+          example: Court slot is unavailable
+        status:
+          type: integer
+          description: HTTP status code repeated in the payload.
+          example: 409
+        detail:
+          type: string
+          description: Specific details for this failure instance. Never contains stack traces.
+          example: Court crt_8Bx1 is closed for maintenance during this slot.
+        instance:
+          type: string
+          description: The endpoint address where this error occurred.
+          example: /v1/bookings
+
+  responses:
+    BadRequest:
+      description: The request payload was malformed or missing query fields.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/malformed-request
+            title: The request could not be parsed
+            status: 400
+
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/not-found
+            title: Resource not found
+            status: 404
+
+    Conflict:
+      description: The request was valid but refused by a business rule.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/slot-already-booked
+            title: That time slot is already booked
+            status: 409
+
+    UnprocessableEntity:
+      description: The JSON is well-formed but has validation errors or missing required headers.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://api.example.com/problems/validation-failed
+            title: Form validation failed
+            status: 422
